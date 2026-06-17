@@ -1,4 +1,4 @@
-from typing import TypedDict, List, Dict, Any, Annotated
+from typing import TypedDict, List, Dict, Any, Annotated, Optional
 from pydantic import BaseModel, Field
 import operator
 
@@ -26,12 +26,22 @@ class LegalGraphState(TypedDict):
     # The original request from the user
     user_query: str
     
+    # Track which query the plan was generated for (avoid re-planning on same query)
+    last_query: str
+    
+    # Extracted jurisdiction for rule scoping
+    jurisdiction: str
+    
+    # Track replanning iterations to prevent infinite loops
+    replan_count: int
+    
     # The dynamic checklist managed by the Planner and Replanner
     plan_checklist: List[str]
     
     # Audit trail: Keep track of what we've done
-    completed_tasks: Annotated[List[str], operator.add]
-    failed_tasks: Annotated[List[str], operator.add]
+    # Each entry is a structured record to enable analytics
+    completed_tasks: Annotated[List[Dict[str, Any]], operator.add]
+    failed_tasks: Annotated[List[Dict[str, Any]], operator.add]
     
     # The verified data pulled by the Executor/Retriever
     retrieved_citations: Annotated[List[Dict[str, Any]], operator.add]

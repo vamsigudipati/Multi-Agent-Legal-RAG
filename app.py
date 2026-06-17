@@ -73,8 +73,20 @@ workflow.add_conditional_edges(
 # 6. Replanner ALWAYS loops back to Executor to run the new task
 workflow.add_edge("Replanner", "Executor")
 
-# 7. Writer finishes the graph execution
-workflow.add_edge("Writer", END)
+# 7. Writer either finishes or requests replanning based on evaluation
+def writer_router(state: LegalGraphState):
+    if state.get("routing_critique"):
+        return "replan"
+    return "finish"
+
+workflow.add_conditional_edges(
+    "Writer",
+    writer_router,
+    {
+        "replan": "Replanner",
+        "finish": END
+    }
+)
 
 # Compile the Graph
 app = workflow.compile()
@@ -86,7 +98,10 @@ if __name__ == "__main__":
     print("\n🚀 Starting Local LangGraph Execution...\n")
     
     initial_state = {
-        "user_query": "Analyze the holding in TechCorp v. Innovate Solutions regarding trade secret protection for software architecture.",
+        "user_query": "Assess the enforceability of non-compete clauses for software engineers in California and recommend employer best practices to minimize legal risk.",
+        "last_query": "",
+        "jurisdiction": "",
+        "replan_count": 0,
         "plan_checklist": [],
         "completed_tasks": [],
         "failed_tasks": [],
