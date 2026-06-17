@@ -98,7 +98,7 @@ if __name__ == "__main__":
     print("\n🚀 Starting Local LangGraph Execution...\n")
     
     initial_state = {
-        "user_query": "Assess the enforceability of non-compete clauses for software engineers in California and recommend employer best practices to minimize legal risk.",
+        "user_query": "Assess whether 'garden leave' clauses combined with robust confidentiality and invention-assignment provisions are sufficient to protect a software company's intellectual property when hiring engineers who will work across California and New York. Provide model contract language (concise), state-specific compliance notes, and practical onboarding controls to minimize legal risk.",
         "last_query": "",
         "jurisdiction": "",
         "replan_count": 0,
