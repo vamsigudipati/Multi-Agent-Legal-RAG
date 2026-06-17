@@ -101,6 +101,7 @@ if __name__ == "__main__":
         "user_query": "Assess whether 'garden leave' clauses combined with robust confidentiality and invention-assignment provisions are sufficient to protect a software company's intellectual property when hiring engineers who will work across California and New York. Provide model contract language (concise), state-specific compliance notes, and practical onboarding controls to minimize legal risk.",
         "last_query": "",
         "jurisdiction": "",
+        "jurisdictions": [],
         "replan_count": 0,
         "plan_checklist": [],
         "completed_tasks": [],

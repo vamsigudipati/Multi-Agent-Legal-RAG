@@ -29,8 +29,11 @@ class LegalGraphState(TypedDict):
     # Track which query the plan was generated for (avoid re-planning on same query)
     last_query: str
     
-    # Extracted jurisdiction for rule scoping
+    # Extracted primary jurisdiction for rule scoping
     jurisdiction: str
+    
+    # All extracted jurisdictions (for multi-state analysis)
+    jurisdictions: List[str]
     
     # Track replanning iterations to prevent infinite loops
     replan_count: int

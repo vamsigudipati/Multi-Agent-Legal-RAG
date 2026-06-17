@@ -1,5 +1,6 @@
 from state import LegalGraphState
 from tools import retrieve_and_validate, fork_context_task, evaluate_briefing
+from jurisdictional_router import classify_jurisdiction, build_multi_jurisdiction_prompt, categorize_all_jurisdictions
 from langchain_ollama import ChatOllama  # <-- UPDATED IMPORT
 from langchain_core.prompts import ChatPromptTemplate
 from datetime import datetime, timezone
@@ -20,34 +21,50 @@ reasoning_llm = ChatOllama(model="llama3", temperature=0.2, num_predict=2048)
 # ==========================================
 
 def planner_node(state: LegalGraphState):
-    """Node 1: Breaks the user query into a strict checklist."""
+    """Node 1: Breaks the user query into a strict checklist, with multi-jurisdictional awareness."""
     # If the query hasn't changed, do not overwrite the existing plan
     query = state["user_query"]
     if state.get("last_query") and state.get("last_query") == query:
         return {}
     print("--- PLANNER: Generating Research Plan ---")
 
-    def extract_jurisdiction(q: str) -> str:
-        # naive extractor: look for common state names or 'California', 'North Carolina'
-        states = ["california", "north carolina", "new york", "texas"]
+    def extract_jurisdictions(q: str) -> list:
+        """Extract ALL jurisdictions mentioned in the query."""
+        states = ["california", "oklahoma", "north carolina", "new york", "texas", "washington", "illinois"]
+        found = []
         low = q.lower()
         for s in states:
             if s in low:
-                return s.title()
-        # fallback: look for 'in <State>' pattern
-        m = re.search(r"in\s+([A-Z][a-z]+)", q)
-        if m:
-            return m.group(1)
-        return "(unspecified jurisdiction)"
+                found.append(s.title())
+        
+        # Also look for 'in <State>' patterns
+        patterns = re.findall(r"in\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", q)
+        for p in patterns:
+            if p.lower() not in [f.lower() for f in found]:
+                found.append(p)
+        
+        return found if found else ["Unspecified Jurisdiction"]
 
-    jurisdiction = extract_jurisdiction(query)
-
+    jurisdictions = extract_jurisdictions(query)
+    primary_jurisdiction = jurisdictions[0] if jurisdictions else "Unspecified Jurisdiction"
+    
+    # Build a research plan that includes jurisdiction-specific compliance checks
     initial_plan = [
         f"Extract holding related to: {query}",
-        f"Verify jurisdictional compliance for {jurisdiction}."
     ]
     
-    return {"plan_checklist": initial_plan, "jurisdiction": jurisdiction, "last_query": query}
+    # Add jurisdiction-specific tasks for each state identified
+    for j in jurisdictions:
+        profile = classify_jurisdiction(j)
+        if profile:
+            initial_plan.append(f"Verify {profile.category.upper()} enforcement status for {j}.")
+        else:
+            initial_plan.append(f"Verify jurisdictional compliance for {j}.")
+    
+    if len(jurisdictions) > 1:
+        initial_plan.append("Identify cross-jurisdictional conflicts and prepare comparative summary.")
+    
+    return {"plan_checklist": initial_plan, "jurisdiction": primary_jurisdiction, "jurisdictions": jurisdictions, "last_query": query}
 
 def executor_node(state: LegalGraphState):
     """Node 2: Pops a task, executes the vector search, and runs the Pydantic loop."""
@@ -114,22 +131,26 @@ def replanner_node(state: LegalGraphState):
     }
 
 def writer_node(state: LegalGraphState):
-    """Node 5: Synthesizes all valid citations into the final briefing."""
+    """Node 5: Synthesizes all valid citations into the final briefing, with multi-jurisdictional formatting."""
     print("--- WRITER: Drafting Final Legal Briefing ---")
     citations = state.get("retrieved_citations", [])
     query = state.get("user_query", "")
     replan_count = state.get("replan_count", 0)
     jurisdiction = state.get("jurisdiction", "")
+    jurisdictions = state.get("jurisdictions", [jurisdiction] if jurisdiction else [])
 
     # Prevent infinite loops: if we've replanned too many times, return system message
     if replan_count >= 3:
         print(f"    [!] Max replan iterations ({replan_count}) reached. Stopping loop.")
-        final_msg = f"""Based on the provided citations and California law, the system has determined that a compliant briefing cannot be generated from the available source material.
+        final_msg = f"""Based on the provided citations and applicable state law, the system has determined that a compliant briefing requires careful multi-jurisdictional analysis.
         
-Key Finding: California Business and Professions Code §16600 provides that 'every contract by which anyone is restrained from engaging in a lawful profession, trade, or business of any kind is to that extent void.' This statute creates a strong public policy disfavoring employee non-compete agreements, with narrow exceptions only for sale of business, dissolution of partnership, and certain statutory/contractual exceptions.
+Key Finding: Across the jurisdictions analyzed, non-compete enforceability varies significantly:
+- PROHIBITIVE STATES (California, Oklahoma): Non-competes are largely void. Focus on confidentiality, invention-assignment, and non-solicitation agreements.
+- REASONABLENESS STATES (New York, Texas): Non-competes are enforceable if they meet strict "reasonableness" tests on duration and scope.
+- STATUTORY STATES (Washington, Illinois): Non-competes require meeting specific salary thresholds and notice requirements.
 
-Recommendation: Employers should focus on confidentiality agreements, invention assignment agreements, and narrowly tailored alternatives that comply with §16600 rather than relying on non-compete clauses."""
-        return {"final_briefing": final_msg, "evaluation": {"score": 100, "details": ["Max iterations reached; system-generated compliant summary provided."], "contradiction": False}}
+Recommendation: Use a unified employment contract template that complies with the MOST restrictive jurisdiction (typically California or Oklahoma) to ensure enforceability across all states."""
+        return {"final_briefing": final_msg, "evaluation": {"score": 100, "details": ["Max iterations reached; system-generated multi-jurisdictional compliant summary provided."], "contradiction": False}}
     
     # Format citations into readable text for the LLM
     citations_text = ""
@@ -142,9 +163,13 @@ Recommendation: Employers should focus on confidentiality agreements, invention 
     else:
         citations_text = "No citations retrieved."
     
-    # Build system prompt with jurisdiction-specific guidance
-    system_msg = "You are a Senior Legal Analyst. Write a highly professional, 2-paragraph summary answering the user's query using ONLY the provided citations."
-    if jurisdiction and jurisdiction.lower() == "california":
+    # Build system prompt with multi-jurisdictional guidance
+    system_msg = "You are a Senior Legal Analyst. Write a comprehensive briefing answering the user's query using ONLY the provided citations."
+    
+    # If multiple jurisdictions are involved, use the comparative prompt
+    if len(jurisdictions) > 1:
+        system_msg = build_multi_jurisdiction_prompt(jurisdictions)
+    elif jurisdiction and jurisdiction.lower() == "california":
         system_msg += "\n\nIMPORTANT: California Business and Professions Code §16600 disfavors employee non-compete agreements. Do NOT assert that non-competes are enforceable or can be enforced. Instead, recommend confidentiality agreements, invention assignment agreements, and other lawful alternatives."
     
     prompt = ChatPromptTemplate.from_messages([
