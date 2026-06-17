@@ -1,7 +1,3 @@
-Since the side panel doesn't support direct file downloads, I have provided the complete Markdown content below. You can simply copy this, create a file named `README.md` in your project folder, and paste it in.
-
----
-
 # ⚖️ Multi-Agent Legal RAG Framework
 
 An enterprise-grade, fully local Retrieval-Augmented Generation (RAG) pipeline built with LangGraph. This system utilizes a multi-agent architecture to perform legal research, enforce strict data schemas via Pydantic, and synthesize factual briefings—all running locally with zero API costs.
