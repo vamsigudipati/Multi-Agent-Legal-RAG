@@ -148,4 +148,8 @@ This repository recently received several robustness, architectural, and evaluat
 
 - Evaluator unit tests were added/updated to verify contradiction detection and modal phrasing handling (currently `tests/test_evaluator.py`, `tests/test_evaluator_modal.py`, `tests/test_evaluator_enforcing.py`), and the test suite currently passes (`3 passed`).
 
+<<<<<<< HEAD
 If you want this expanded into a formal CONTRIBUTING guide or change-log section, I can add that next.
+=======
+If you want this expanded into a formal CONTRIBUTING guide or change-log section, I can add that next.
+>>>>>>> 8c93c92 (docs: update README with architectural, evaluation, validation, and test changes)
