@@ -1,0 +1,7 @@
+langgraph
+langchain
+langchain-ollama
+langchain-chroma
+chromadb
+pydantic>=2.0
+sentence-transformers

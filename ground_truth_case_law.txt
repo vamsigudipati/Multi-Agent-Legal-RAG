@@ -1,0 +1,15 @@
+
+    IN THE SUPREME COURT OF NORTH CAROLINA
+    Case Name: TechCorp v. Innovate Solutions
+    Year: 2024
+    Jurisdiction: North Carolina Supreme Court
+    
+    Background: TechCorp alleged that Innovate Solutions misappropriated proprietary 
+    software architecture patterns related to agentic testing frameworks.
+    
+    Holding: The court ruled that software architecture patterns, when actively protected 
+    by strict internal access controls and non-disclosure agreements, qualify as 
+    trade secrets under the North Carolina Trade Secrets Protection Act. The court 
+    emphasized that mere obscurity of the code is insufficient; affirmative protective 
+    measures are required.
+    
