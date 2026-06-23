@@ -4,10 +4,17 @@ load_dotenv()  # Hooks up your .env file to the system for LangSmith tracking
 from langgraph.graph import StateGraph, END
 from state import LegalGraphState
 from nodes import planner_node, executor_node, grader_node, replanner_node, writer_node
+from nodes import input_guard_node
 
 # ==========================================
 # CONDITIONAL ROUTING LOGIC
 # ==========================================
+
+def guard_router(state: LegalGraphState):
+    """Router: Ends execution immediately if a security threat is detected."""
+    if state.get("security_rejection"):
+        return "block_and_end"
+    return "proceed_to_planner"
 
 def check_checklist(state: LegalGraphState):
     """Router: Decides whether to start research or go straight to writing."""
@@ -30,6 +37,12 @@ def grader_router(state: LegalGraphState):
     # 3. If passed and checklist is empty, we are done!
     return "finish_and_write"
 
+def writer_router(state: LegalGraphState):
+    """Router: Writer either finishes or requests replanning based on evaluation"""
+    if state.get("routing_critique"):
+        return "replan"
+    return "finish"
+
 # ==========================================
 # GRAPH CONSTRUCTION
 # ==========================================
@@ -37,6 +50,7 @@ def grader_router(state: LegalGraphState):
 workflow = StateGraph(LegalGraphState)
 
 # 1. Add our Agent Nodes
+workflow.add_node("InputGuard", input_guard_node)
 workflow.add_node("Planner", planner_node)
 workflow.add_node("Executor", executor_node)
 workflow.add_node("Grader", grader_node)
@@ -44,9 +58,19 @@ workflow.add_node("Replanner", replanner_node)
 workflow.add_node("Writer", writer_node)
 
 # 2. Define the Entry Point
-workflow.set_entry_point("Planner")
+workflow.set_entry_point("InputGuard")
 
-# 3. Planner checks if there are tasks to execute
+# 3a. Guard Conditional Routing (The new Front Door)
+workflow.add_conditional_edges(
+    "InputGuard",
+    guard_router,
+    {
+        "block_and_end": END,          
+        "proceed_to_planner": "Planner" 
+    }
+)
+
+# 3b. Planner Conditional Routing (RESTORED: The bridge to Executor)
 workflow.add_conditional_edges(
     "Planner",
     check_checklist,
@@ -74,11 +98,6 @@ workflow.add_conditional_edges(
 workflow.add_edge("Replanner", "Executor")
 
 # 7. Writer either finishes or requests replanning based on evaluation
-def writer_router(state: LegalGraphState):
-    if state.get("routing_critique"):
-        return "replan"
-    return "finish"
-
 workflow.add_conditional_edges(
     "Writer",
     writer_router,
@@ -91,6 +110,7 @@ workflow.add_conditional_edges(
 # Compile the Graph
 app = workflow.compile()
 
+
 # ==========================================
 # EXECUTION (Local Testing)
 # ==========================================
@@ -98,7 +118,7 @@ if __name__ == "__main__":
     print("\n🚀 Starting Local LangGraph Execution...\n")
     
     initial_state = {
-        "user_query": "Assess whether 'garden leave' clauses combined with robust confidentiality and invention-assignment provisions are sufficient to protect a software company's intellectual property when hiring engineers who will work across California and New York. Provide model contract language (concise), state-specific compliance notes, and practical onboarding controls to minimize legal risk.",
+        "user_query": "Based on the provided legal documents, what constitutes 'independent economic value' when a court is determining whether a company's customer list qualifies as a protected trade secret?",
         "last_query": "",
         "jurisdiction": "",
         "jurisdictions": [],
@@ -115,6 +135,12 @@ if __name__ == "__main__":
     final_state = app.invoke(initial_state)
     
     print("\n==========================================")
-    print("🏆 FINAL LEGAL BRIEFING:")
+    if final_state.get("security_rejection"):
+        print("🛑 SECURITY INTERVENTION:")
+        print(final_state["security_rejection"])
+    else:
+        print("🏆 FINAL LEGAL BRIEFING:")
+        print(final_state["final_briefing"])
     print("==========================================\n")
-    print(final_state["final_briefing"])
+    
+    

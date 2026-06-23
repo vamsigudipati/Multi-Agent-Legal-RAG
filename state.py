@@ -26,6 +26,9 @@ class LegalGraphState(TypedDict):
     # The original request from the user
     user_query: str
     
+    # In state.py, add this key to your TypedDict:
+    security_rejection: str
+    
     # Track which query the plan was generated for (avoid re-planning on same query)
     last_query: str
     
