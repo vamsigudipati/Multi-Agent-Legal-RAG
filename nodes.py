@@ -1,12 +1,13 @@
+import os
+import json
+from datetime import datetime, timezone
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama
+
 from state import LegalGraphState
 from tools import retrieve_and_validate, fork_context_task, evaluate_briefing
 from jurisdictional_router import classify_jurisdiction, build_multi_jurisdiction_prompt, categorize_all_jurisdictions
-from langchain_ollama import ChatOllama  # <-- UPDATED IMPORT
-from langchain_core.prompts import ChatPromptTemplate
-from datetime import datetime, timezone
-import re
-import os
-import json
 
 # ==========================================
 # MODEL ALLOCATION (Cost & Speed Optimization)
@@ -66,40 +67,55 @@ Classification:"""
     print("    [✓] Input cleared security scan.")
     return {"security_rejection": ""}
 
+def semantic_jurisdiction_router(query: str) -> list:
+    """
+    Uses the admin LLM with few-shot prompting to semantically extract jurisdictions.
+    """
+    router_prompt = f"""You are a strict Legal Jurisdiction Extractor.
+Identify explicitly mentioned US States or jurisdictions. DO NOT guess based on the topic.
+
+Example 1:
+Query: "Are non-competes legal in the Golden State?"
+Output: California
+
+Example 2:
+Query: "Based on the provided documents, what is a trade secret?"
+Output: Unspecified
+
+Example 3:
+Query: "Employment law differences between NY and Texas"
+Output: New York, Texas
+
+User Query: "{query}"
+Output:"""
+
+    response = admin_llm.invoke(router_prompt)
+    raw_output = response.content.strip()
+    
+    if "UNSPECIFIED" in raw_output.upper():
+        return []
+        
+    jurisdictions = [j.strip() for j in raw_output.split(",") if j.strip()]
+    return jurisdictions
+
 def planner_node(state: LegalGraphState):
     """Node 1: Breaks the user query into a strict checklist, with multi-jurisdictional awareness."""
-    # If the query hasn't changed, do not overwrite the existing plan
     query = state["user_query"]
     if state.get("last_query") and state.get("last_query") == query:
         return {}
     print("--- PLANNER: Generating Research Plan ---")
 
-    def extract_jurisdictions(q: str) -> list:
-        """Extract ALL jurisdictions mentioned in the query."""
-        states = ["california", "oklahoma", "north carolina", "new york", "texas", "washington", "illinois"]
-        found = []
-        low = q.lower()
-        for s in states:
-            if s in low:
-                found.append(s.title())
+    jurisdictions = semantic_jurisdiction_router(query)
+    if not jurisdictions:
+        jurisdictions = ["Unspecified Jurisdiction"]
         
-        # Also look for 'in <State>' patterns
-        patterns = re.findall(r"in\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", q)
-        for p in patterns:
-            if p.lower() not in [f.lower() for f in found]:
-                found.append(p)
-        
-        return found if found else ["Unspecified Jurisdiction"]
-
-    jurisdictions = extract_jurisdictions(query)
-    primary_jurisdiction = jurisdictions[0] if jurisdictions else "Unspecified Jurisdiction"
+    primary_jurisdiction = jurisdictions[0]
+    print(f"    [i] Semantically detected jurisdictions: {jurisdictions}")
     
-    # Build a research plan that includes jurisdiction-specific compliance checks
     initial_plan = [
         f"Extract holding related to: {query}",
     ]
     
-    # Add jurisdiction-specific tasks for each state identified
     for j in jurisdictions:
         profile = classify_jurisdiction(j)
         if profile:
@@ -110,17 +126,30 @@ def planner_node(state: LegalGraphState):
     if len(jurisdictions) > 1:
         initial_plan.append("Identify cross-jurisdictional conflicts and prepare comparative summary.")
     
-    return {"plan_checklist": initial_plan, "jurisdiction": primary_jurisdiction, "jurisdictions": jurisdictions, "last_query": query}
+    # Set the first task explicitly as the active one
+    return {
+        "plan_checklist": initial_plan, 
+        "current_task": initial_plan[0], 
+        "jurisdiction": primary_jurisdiction, 
+        "jurisdictions": jurisdictions, 
+        "last_query": query,
+        "replan_count": 0,
+        "failed_tasks": []
+    }
 
 def executor_node(state: LegalGraphState):
-    """Node 2: Pops a task, executes the vector search, and runs the Pydantic loop."""
+    """Node 2: Executes the active task and puts unverified data into the holding pen."""
     checklist = state.get("plan_checklist", [])
-    if not checklist:
-        return state
+    current_task = state.get("current_task")
+    
+    if not current_task and checklist:
+        current_task = checklist[0]
         
-    current_task = checklist.pop(0)
+    if not current_task:
+        return {}
+        
     print(f"--- EXECUTOR: Running task -> {current_task} ---")
-    # Decide whether to fork context to a sub-agent for deep dives
+    
     if "deep-dive" in current_task.lower() or "recovery task" in current_task.lower():
         result = fork_context_task(current_task)
     else:
@@ -132,61 +161,58 @@ def executor_node(state: LegalGraphState):
         completed = state.get("completed_tasks", [])
         completed.append({"task": current_task, "timestamp": timestamp, "meta": {}})
 
-        retrieved = state.get("retrieved_citations", [])
-        retrieved.append(result["data"])
-
+        # FIX: Send unverified data to the holding pen. DO NOT touch retrieved_citations!
         return {
-            "plan_checklist": checklist,
             "completed_tasks": completed,
-            "retrieved_citations": retrieved
+            "current_context": str(result["data"])
         }
     else:
         failed = state.get("failed_tasks", [])
         failed.append({"task": current_task, "error": result.get("error"), "timestamp": timestamp})
 
         return {
-            "plan_checklist": checklist,
             "failed_tasks": failed,
-            "routing_critique": result.get("error")
-        }
+            "routing_critique": result.get("error"),
+            "current_context": "" # Clear holding pen on fetch error
+        }   
 
 def grader_node(state: LegalGraphState):
-    """Grader: Evaluates if retrieved data is semantically relevant and grounded."""
+    """Grader: Evaluates the holding pen. Only passes verified data to the Writer."""
     print("--- GRADER: Evaluating retrieved data ---")
     
-    # 1. Get current state
-    citations = state.get("retrieved_citations", [])
     checklist = state.get("plan_checklist", [])
     replan_count = state.get("replan_count", 0)
-    current_task = checklist[0] if checklist else "Final Review"
+    current_task = state.get("current_task") if state.get("current_task") else "Research Task"
+    
+    # Read the unverified data from the holding pen
+    citation_text = state.get("current_context", "").strip()
     
     # ==========================================
-    # THE CIRCUIT BREAKER
+    # CIRCUIT BREAKER 
     # ==========================================
     if replan_count >= 2:
         print(f"    [!] Circuit Breaker Tripped: Data for '{current_task}' not found. Dropping task.")
-        # Remove the impossible task so we can move forward
-        new_checklist = checklist[1:] if len(checklist) > 0 else []
+        new_checklist = checklist[1:] if len(checklist) > 1 else []
+        next_task = new_checklist[0] if new_checklist else "Final Review"
+        
         return {
-            "routing_critique": "",  # Clear the critique so the router doesn't loop
-            "plan_checklist": new_checklist, # Save the shorter checklist
-            "replan_count": 0, # Reset the counter for the next task
-            "failed_tasks": state.get("failed_tasks", []) + [current_task] # Log the failure
+            "routing_critique": "",  
+            "plan_checklist": new_checklist, 
+            "current_task": next_task, 
+            "replan_count": 0, 
+            "current_context": "", # Flush holding pen
+            "failed_tasks": state.get("failed_tasks", []) + [current_task] 
         }
     # ==========================================
     
-    # Clean the citations into a single string
-    citation_text = "\n".join([str(c) for c in citations]).strip()
-    
-    # 2. Hard syntax check for empty or garbage data
     if not citation_text or len(citation_text) < 15:
         print("    [X] Data failed: Citations are completely empty.")
         return {
-            "routing_critique": f"Retrieval failed for task: '{current_task}'. The database returned no text. Replanning required.",
-            "replan_count": replan_count + 1  # <-- Increment counter!
+            "routing_critique": f"Retrieval failed for task: '{current_task}'.",
+            "replan_count": replan_count + 1,
+            "current_context": ""
         }
 
-    # 3. LLM as a Judge (Strict Binary Check)
     evaluator_prompt = f"""You are a strict binary evaluator. You must output exactly one word: PASS or FAIL. No other text is allowed.
 
 Task: "{current_task}"
@@ -201,39 +227,40 @@ Evaluation:"""
     response = admin_llm.invoke(evaluator_prompt)
     grade = response.content.strip().upper()
     
-    # 4. Enforce strict routing based on the binary keyword
     if "PASS" in grade and "FAIL" not in grade:
         print("    [✓] Data passed semantic quality gates.")
+        new_checklist = checklist[1:] if len(checklist) > 1 else []
+        next_task = new_checklist[0] if new_checklist else "Final Review"
+        
+        # FIX: Safe extraction of existing verified citations
+        existing_citations = state.get("retrieved_citations", [])
+        # We create a brand new list to avoid in-place mutation bugs
+        updated_citations = existing_citations.copy() 
+        updated_citations.append(citation_text)
+        
         return {
             "routing_critique": "",
-            "replan_count": 0 # Reset counter on success!
+            "plan_checklist": new_checklist,
+            "current_task": next_task,
+            "replan_count": 0,
+            "retrieved_citations": updated_citations, # <-- Official promotion to safe data!
+            "current_context": "" 
         }
     else:
-        print("    [X] Data failed semantic check. Blocking hallucination.")
+        print("    [X] Data failed semantic check. Blocking hallucination and flushing state.")
         return {
-            "routing_critique": f"Semantic evaluation failed for task '{current_task}'. The retrieved text did not contain relevant legal facts. Adjust your search strategy and try again.",
-            "replan_count": replan_count + 1  # <-- Increment counter so the breaker trips!
+            "routing_critique": f"Semantic evaluation failed for task '{current_task}'.",
+            "replan_count": replan_count + 1,
+            "current_context": ""  # Flush the holding pen, leaving retrieved_citations totally safe
         }
 
 def replanner_node(state: LegalGraphState):
-    """Node 4: Injects a recovery task if the Grader fails."""
-    print("--- REPLANNER: Adjusting checklist due to failure ---")
-    critique = state.get("routing_critique", "")
-    
-    new_task = f"RECOVERY TASK: Address failure -> {critique}"
-    current_checklist = state.get("plan_checklist", [])
-    
-    current_checklist.insert(0, new_task)
-    
+    """Replanner: Adjusts internal routing state based on grader critique without modifying array structure."""
+    print("--- REPLANNER: Adjusting strategy due to failure ---")
+    critique = state.get("routing_critique", "No critique provided.")
     return {
-        "plan_checklist": current_checklist,
-        "routing_critique": "" 
+        "routing_critique": critique
     }
-
-import os
-import json
-from datetime import datetime, timezone
-from langchain_core.prompts import ChatPromptTemplate
 
 def writer_node(state: LegalGraphState):
     """Node 5: Synthesizes all valid citations into the final briefing, with multi-jurisdictional formatting."""
@@ -259,64 +286,56 @@ Key Finding: Across the jurisdictions analyzed, non-compete enforceability varie
 Recommendation: Use a unified employment contract template that complies with the MOST restrictive jurisdiction (typically California or Oklahoma) to ensure enforceability across all states."""
         return {"final_briefing": final_msg, "evaluation": {"score": 100, "details": ["Max iterations reached; system-generated multi-jurisdictional compliant summary provided."], "contradiction": False}}
     
-    # ---------------------------------------------------------
-    # ANTI-HALLUCINATION: Format citations or set NO DATA flag
-    # ---------------------------------------------------------
-    # 1. First, forcefully clean and extract any actual text from the citations
-    citations_text = ""
-    if citations:
-        cleaned_citations = []
-        for c in citations:
-            if isinstance(c, dict):
-                # Only keep it if it actually has a case name or holding
-                if c.get('case_name') or c.get('holding'):
-                    cleaned_citations.append(f"- {c.get('case_name', 'Unknown Case')}: {c.get('holding', 'No holding provided')}")
-            elif str(c).strip():
-                cleaned_citations.append(str(c))
-        
-        citations_text = "\n\n".join(cleaned_citations).strip()
-
-    # 2. If the cleaned text is empty (or just tiny garbage), trigger the NO DATA flag
-    if not citations_text or len(citations_text) < 15:
-        context_block = "STATUS: NO DATA FOUND. The vector database did not contain any documents matching the research tasks."
-    else:
-        context_block = f"Verified Citations:\n{citations_text}"
+    # Clean the citations text block
+    cleaned_citations = []
+    for c in citations:
+        if isinstance(c, dict):
+            if c.get('case_name') or c.get('holding'):
+                cleaned_citations.append(f"- {c.get('case_name', 'Unknown Case')}: {c.get('holding', 'No holding provided')}")
+        elif str(c).strip() and "Unknown Case" not in str(c):
+            cleaned_citations.append(str(c))
+            
+    citations_text = "\n\n".join(cleaned_citations).strip()
     
     # ---------------------------------------------------------
-    # BUILD SYSTEM PROMPT (Preserving your Custom Logic)
+    # ANTI-HALLUCINATION: THE TRUE SHORT-CIRCUIT
+    # ---------------------------------------------------------
+    # If the Grader flushed everything, citations_text will be empty or clean string artifacts.
+    if not citations_text or len(citations_text) < 10:
+        print("    [!] Context block is empty (all data rejected). Triggering Python hard-fallback.")
+        fallback_msg = "Based on the provided legal documents, I was unable to find specific legal precedents or definitions to answer this query."
+        return {
+            "final_briefing": fallback_msg, 
+            "evaluation": {"score": 0, "details": ["Hard fallback triggered due to empty citations."], "contradiction": False}
+        }
+
+    # Set context and proceed to LLM safely
+    context_block = f"Verified Citations:\n{citations_text}"
+    
+    # ---------------------------------------------------------
+    # BUILD SYSTEM PROMPT 
     # ---------------------------------------------------------
     if len(jurisdictions) > 1:
-        # Assuming build_multi_jurisdiction_prompt is imported/defined elsewhere
         system_msg = build_multi_jurisdiction_prompt(jurisdictions)
     else:
         system_msg = "You are a Senior Legal Analyst. Write a comprehensive briefing answering the user's query using ONLY the provided citations."
         if jurisdiction and jurisdiction.lower() == "california":
             system_msg += "\n\nIMPORTANT: California Business and Professions Code §16600 disfavors employee non-compete agreements. Do NOT assert that non-competes are enforceable or can be enforced. Instead, recommend confidentiality agreements, invention assignment agreements, and other lawful alternatives."
     
-    # Append the strict anti-hallucination rules
-    system_msg += """
-
-RULES FOR DRAFTING:
-1. Base your answer STRICTLY on the Context provided below.
-2. IF the Context says "STATUS: NO DATA FOUND", you MUST output exactly: "Based on the provided legal documents, I was unable to find specific legal precedents or definitions to answer this query." Do not invent laws, cite outside cases, or hallucinate Restatements.
-3. IF there are valid citations in the Context, summarize them accurately and cite them.
-4. DO NOT rely on your internal training data.
-"""
+    system_msg += "\n\nRULES FOR DRAFTING:\n1. Base your answer STRICTLY on the Context provided below.\n2. DO NOT rely on your internal training data."
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_msg),
         ("user", "Query: {query}\n\nContext:\n{context}")
     ])
     
-    # Assuming reasoning_llm is imported/defined globally in your nodes.py
     chain = prompt | reasoning_llm
     response = chain.invoke({"query": query, "context": context_block})
-
     final_text = response.content
     if not final_text or final_text.strip() == "":
         final_text = "[No briefing generated]"
     
-    # Catch suspiciously short responses (likely LLM was interrupted)
+    # Catch suspiciously short responses
     if len(final_text.strip()) < 50:
         print(f"    [!] Suspiciously short response detected ({len(final_text)} chars). Treating as incomplete.")
         critique = "LLM response was truncated or incomplete. Replanning required."
@@ -325,8 +344,6 @@ RULES FOR DRAFTING:
         new_replan_count = replan_count + 1
         return {"final_briefing": "", "routing_critique": critique, "plan_checklist": checklist, "replan_count": new_replan_count}
 
-    # Run the evaluator scaffold and attach results to state
-    # Assuming evaluate_briefing is imported/defined elsewhere
     eval_result = evaluate_briefing(final_text, jurisdiction=jurisdiction)
 
     # Persist the run for auditing and diffs
@@ -349,7 +366,6 @@ RULES FOR DRAFTING:
 
     print(f"    [i] Persisted run to: {fname}")
 
-    # If evaluator detected a contradiction or score is too low, trigger replanning
     if eval_result.get("contradiction") or eval_result.get("score", 100) < 50:
         critique = "Evaluation detected jurisdictional contradiction. Replanning required."
         checklist = state.get("plan_checklist", [])

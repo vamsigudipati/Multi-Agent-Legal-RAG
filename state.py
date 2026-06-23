@@ -43,6 +43,8 @@ class LegalGraphState(TypedDict):
     
     # The dynamic checklist managed by the Planner and Replanner
     plan_checklist: List[str]
+    current_task: str
+    current_context: str
     
     # Audit trail: Keep track of what we've done
     # Each entry is a structured record to enable analytics
