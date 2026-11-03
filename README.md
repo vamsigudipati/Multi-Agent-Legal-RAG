@@ -123,6 +123,27 @@ The system includes a robust pytest suite ensuring both functional regression an
 * **Security Tests:** Ensures the Input Guard catches prompt injections and exfiltration attempts.
 * **Router Tests (`test_semantic_router.py`):** Isolates the Phi-3 LLM to verify few-shot extraction accuracy, ensuring geographic obfuscations (e.g., "Empire State") are correctly resolved and empty queries safely default to "Unspecified".
 
+## 🔧 Known limitations and fixes
+
+Two weaknesses in earlier versions have been fixed. Both are covered by model-free tests in `tests/`.
+
+### 1. Contradiction check was not negation-aware (fixed)
+`evaluate_briefing()` flags California briefings that claim employee non-competes are enforceable, which contradicts Business & Professions Code §16600. The old check matched the stem "enforc" anywhere in the text, so correct sentences such as "non-competes are **not** enforceable in California" or "courts **will not** enforce them" were flagged as contradictions and sent the graph back into a needless replan loop.
+
+The check now splits the briefing into sentences and clauses. A clause only counts as a contradiction when it asserts enforceability of a non-compete **and** nothing in the same clause negates it (not, never, cannot, will not, may not, unenforceable, void, prohibited, and similar). Clauses about other instruments ("employers can enforce NDAs") are not charged against non-competes. The returned rubric keeps the same shape (`score`, `details`, `contradiction`, `evaluated_at`) and now names the offending sentence in `details`. See `tests/test_evaluator_negation.py`.
+
+Remaining limitation: this is still a heuristic over surface text, not a legal parser. Negation that spans clauses ("it would be wrong to say that non-competes are enforceable") can slip through either way.
+
+### 2. The writer returned a canned answer at its replan ceiling (fixed)
+When the writer hit its third replan ceiling it used to return a hand-written multi-state summary with an evaluation score of 100, which was a pre-written answer presented as a verified result. It now returns the same honest "unable to find specific legal precedents" message the empty-citations path uses or, if the Grader had already verified some citations, a briefing clearly labelled `PARTIAL BRIEFING (fallback)` that contains only those citations with nothing added and no LLM call. In both cases the evaluation carries `fallback: true` and a `fallback_reason`, the score is capped well below 100, and the reason is written to the run JSON under `runs/`. See `tests/test_writer_fallback.py`.
+
+### Running the tests without Ollama
+`tests/conftest.py` skips the functional, security-guard and semantic-router tests with an explicit reason when no Ollama server is reachable. The evaluator and writer-fallback tests are pure Python and always run:
+
+```bash
+python -m pytest tests -q
+```
+
 ## 📊 Decoding LangSmith Traces
 Once the pipeline executes, log into your LangSmith dashboard to review the run. You will observe the hierarchical execution flow from `InputGuard` to `Writer` and the Executor retry loops whenever Pydantic catches a schema validation failure or the Grader rejects ungrounded data.
 
