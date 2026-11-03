@@ -18,6 +18,79 @@ admin_llm = ChatOllama(model="phi3", temperature=0.0)
 reasoning_llm = ChatOllama(model="llama3", temperature=0.2, num_predict=2048)
 
 # ==========================================
+# WRITER FALLBACK CONSTANTS & HELPERS
+# ==========================================
+MAX_REPLAN_ITERATIONS = 3
+FALLBACK_NO_PRECEDENTS_MSG = (
+    "Based on the provided legal documents, I was unable to find specific legal precedents "
+    "or definitions to answer this query."
+)
+FALLBACK_REASON_EMPTY_CITATIONS = "empty_citations"
+FALLBACK_REASON_REPLAN_CEILING = "max_replan_iterations_reached"
+# A partial briefing is capped well below a passing score: it is verified material, but
+# it was never synthesised or evaluated as a complete answer.
+PARTIAL_BRIEFING_MAX_SCORE = 50
+
+
+def _persist_run(run: dict) -> str:
+    """Write a run record to ./runs for auditing and diffs. Returns the file path."""
+    runs_dir = os.path.join(os.getcwd(), "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+    fname = os.path.join(runs_dir, f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}.json")
+    with open(fname, "w") as f:
+        json.dump(run, f, indent=2)
+    print(f"    [i] Persisted run to: {fname}")
+    return fname
+
+
+def _fallback_outcome(state: LegalGraphState, citations_text: str, reason: str, detail: str) -> dict:
+    """Build the honest writer outcome used when the graph cannot produce a real briefing.
+
+    If verified citations exist, the briefing is a clearly labelled PARTIAL briefing made
+    only of those citations (no LLM call, nothing added). Otherwise it is the plain
+    "unable to find precedents" message. The evaluation is always marked as a fallback
+    and never scores 100. The reason is persisted in the run JSON.
+    """
+    jurisdiction = state.get("jurisdiction", "")
+    details = [detail]
+
+    if citations_text and len(citations_text) >= 10:
+        final_text = (
+            "PARTIAL BRIEFING (fallback): the research loop stopped before a complete briefing "
+            "could be produced. The material below is limited to citations that passed verification; "
+            "nothing has been added or synthesised, and gaps may remain.\n\n"
+            f"{citations_text}"
+        )
+        eval_result = evaluate_briefing(final_text, jurisdiction=jurisdiction)
+        eval_result["score"] = min(eval_result.get("score", 0), PARTIAL_BRIEFING_MAX_SCORE)
+        details.append("Partial briefing assembled from verified citations only; score capped.")
+        details.extend(eval_result.get("details", []))
+        eval_result["details"] = details
+    else:
+        final_text = FALLBACK_NO_PRECEDENTS_MSG
+        details.append("No verified citations available; returned the honest no-precedents message.")
+        eval_result = {"score": 0, "details": details, "contradiction": False}
+
+    eval_result["fallback"] = True
+    eval_result["fallback_reason"] = reason
+
+    _persist_run({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "user_query": state.get("user_query", ""),
+        "citations": state.get("retrieved_citations", []),
+        "final_briefing": final_text,
+        "evaluation": eval_result,
+        "completed_tasks": state.get("completed_tasks", []),
+        "failed_tasks": state.get("failed_tasks", []),
+        "replan_count": state.get("replan_count", 0),
+        "fallback_reason": reason,
+    })
+
+    # No routing_critique: a fallback ends the loop instead of triggering another replan.
+    return {"final_briefing": final_text, "evaluation": eval_result}
+
+
+# ==========================================
 # AGENT NODES
 # ==========================================
 
@@ -273,19 +346,6 @@ def writer_node(state: LegalGraphState):
     jurisdiction = state.get("jurisdiction", "")
     jurisdictions = state.get("jurisdictions", [jurisdiction] if jurisdiction else [])
 
-    # Prevent infinite loops: if we've replanned too many times, return system message
-    if replan_count >= 3:
-        print(f"    [!] Max replan iterations ({replan_count}) reached. Stopping loop.")
-        final_msg = f"""Based on the provided citations and applicable state law, the system has determined that a compliant briefing requires careful multi-jurisdictional analysis.
-        
-Key Finding: Across the jurisdictions analyzed, non-compete enforceability varies significantly:
-- PROHIBITIVE STATES (California, Oklahoma): Non-competes are largely void. Focus on confidentiality, invention-assignment, and non-solicitation agreements.
-- REASONABLENESS STATES (New York, Texas): Non-competes are enforceable if they meet strict "reasonableness" tests on duration and scope.
-- STATUTORY STATES (Washington, Illinois): Non-competes require meeting specific salary thresholds and notice requirements.
-
-Recommendation: Use a unified employment contract template that complies with the MOST restrictive jurisdiction (typically California or Oklahoma) to ensure enforceability across all states."""
-        return {"final_briefing": final_msg, "evaluation": {"score": 100, "details": ["Max iterations reached; system-generated multi-jurisdictional compliant summary provided."], "contradiction": False}}
-    
     # Clean the citations text block
     cleaned_citations = []
     for c in citations:
@@ -298,16 +358,31 @@ Recommendation: Use a unified employment contract template that complies with th
     citations_text = "\n\n".join(cleaned_citations).strip()
     
     # ---------------------------------------------------------
-    # ANTI-HALLUCINATION: THE TRUE SHORT-CIRCUIT
+    # HONEST FALLBACKS (no LLM call, no invented content)
     # ---------------------------------------------------------
-    # If the Grader flushed everything, citations_text will be empty or clean string artifacts.
+    # 1. Replan ceiling: the loop has been through the Grader/Replanner too many times.
+    #    Earlier versions returned a hand-written multi-state summary scored 100 here;
+    #    that was a canned answer presented as a result. Now we return the same honest
+    #    outcome the empty-citations path uses, or a clearly labelled partial briefing
+    #    built only from the citations the Grader already verified.
+    if replan_count >= MAX_REPLAN_ITERATIONS:
+        print(f"    [!] Max replan iterations ({replan_count}) reached. Returning honest fallback.")
+        return _fallback_outcome(
+            state,
+            citations_text=citations_text,
+            reason=FALLBACK_REASON_REPLAN_CEILING,
+            detail=f"Replan ceiling of {MAX_REPLAN_ITERATIONS} reached (replan_count={replan_count}).",
+        )
+
+    # 2. Empty context: the Grader flushed everything, so there is nothing to write from.
     if not citations_text or len(citations_text) < 10:
         print("    [!] Context block is empty (all data rejected). Triggering Python hard-fallback.")
-        fallback_msg = "Based on the provided legal documents, I was unable to find specific legal precedents or definitions to answer this query."
-        return {
-            "final_briefing": fallback_msg, 
-            "evaluation": {"score": 0, "details": ["Hard fallback triggered due to empty citations."], "contradiction": False}
-        }
+        return _fallback_outcome(
+            state,
+            citations_text="",
+            reason=FALLBACK_REASON_EMPTY_CITATIONS,
+            detail="Hard fallback triggered due to empty citations.",
+        )
 
     # Set context and proceed to LLM safely
     context_block = f"Verified Citations:\n{citations_text}"
@@ -355,16 +430,11 @@ Recommendation: Use a unified employment contract template that complies with th
         "evaluation": eval_result,
         "completed_tasks": state.get("completed_tasks", []),
         "failed_tasks": failed_tasks,
-        "replan_count": replan_count
+        "replan_count": replan_count,
+        "fallback_reason": None
     }
 
-    runs_dir = os.path.join(os.getcwd(), "runs")
-    os.makedirs(runs_dir, exist_ok=True)
-    fname = os.path.join(runs_dir, f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.json")
-    with open(fname, "w") as f:
-        json.dump(run, f, indent=2)
-
-    print(f"    [i] Persisted run to: {fname}")
+    _persist_run(run)
 
     if eval_result.get("contradiction") or eval_result.get("score", 100) < 50:
         critique = "Evaluation detected jurisdictional contradiction. Replanning required."
