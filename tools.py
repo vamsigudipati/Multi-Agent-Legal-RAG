@@ -4,6 +4,7 @@ from langchain_chroma import Chroma
 from pydantic import ValidationError
 from state import LegalCitation
 import os
+import re
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
@@ -111,6 +112,105 @@ def fork_context_task(task: str) -> Dict[str, Any]:
     return retrieve_and_validate(task, path_scope=path_scope, k=5)
 
 
+# ==========================================
+# NEGATION-AWARE ENFORCEABILITY CHECK
+# ==========================================
+# Terms that mean the sentence is talking about a non-compete (directly or by reference).
+_NONCOMPETE_TERMS = re.compile(
+    r"non-?\s?compet(e|es|ition)|covenants?\s+not\s+to\s+compete|restrictive\s+covenants?",
+    re.IGNORECASE,
+)
+# Anaphora that refer back to a non-compete already named in the briefing
+# ("courts will not enforce them", "such clauses are enforceable").
+_ANAPHORA = re.compile(
+    r"\b(them|they|these|those|such|the\s+(clause|clauses|agreement|agreements|covenant|covenants|restriction|restrictions))\b",
+    re.IGNORECASE,
+)
+# Affirmative enforceability language. "enforc" covers enforce/enforced/enforcing/enforceable
+# but deliberately NOT unenforceable / non-enforceable (handled by the negators below).
+_ENFORCE_CLAIM = re.compile(
+    r"(?<![a-z-])(?<!un)enforc"
+    r"|\buph(o|e)ld\b"
+    r"|(?<!non-)(?<!not\s)\bbinding\b"
+    r"|\bvalid\b"
+    r"|increase\s+the\s+(likelihood|chance)"
+    r"|sets?\s+a\s+precedent",
+    re.IGNORECASE,
+)
+# Negation / invalidity markers. If any appears in the same clause as the claim,
+# the clause is read as denying enforceability rather than asserting it.
+_NEGATORS = re.compile(
+    r"\b(not|no|never|cannot|can't|cant|won't|wont|don't|dont|doesn't|doesnt|isn't|isnt|aren't|arent"
+    r"|neither|nor|unenforceable|non-enforceable|nonenforceable|void|voided|voids|invalid|invalidate[sd]?"
+    r"|illegal|unlawful|prohibit(s|ed|ing)?|prohibition|ban|bans|banned|bar|bars|barred"
+    r"|disfavor(s|ed|ing)?|outlaw(s|ed)?|struck\s+down|strikes?\s+down|refuse[sd]?\s+to|declin(e|es|ed)\s+to"
+    r"|fail(s|ed)?\s+to|unlikely)\b"
+    r"|n't\b",
+    re.IGNORECASE,
+)
+# Other instruments a clause may be about instead of a non-compete. A clause that names one
+# of these ("employers can enforce NDAs") is not charged against non-competes.
+_OTHER_INSTRUMENTS = re.compile(
+    r"\b(nda|ndas|non-?disclosure|confidentiality|non-?solicit\w*|invention[- ]assignment|trade[- ]secrets?"
+    r"|garden[- ]leave|arbitration|severance|intellectual[- ]property|ip)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+_CLAUSE_SPLIT = re.compile(
+    r"[,;:()\u2014]|\s--\s|\b(but|however|although|though|whereas|while|unless|except|yet)\b",
+    re.IGNORECASE,
+)
+
+
+def _split_sentences(text: str) -> List[str]:
+    return [s.strip() for s in _SENTENCE_SPLIT.split(text) if s and s.strip()]
+
+
+def _split_clauses(sentence: str) -> List[str]:
+    parts = _CLAUSE_SPLIT.split(sentence)
+    # re.split with a capturing group also returns the separators (or None); drop them.
+    return [p.strip() for p in parts if p and p.strip() and not _CLAUSE_SPLIT.fullmatch(p.strip())]
+
+
+def _clause_asserts_enforceability(clause: str) -> bool:
+    """True when the clause claims enforceability and nothing in the clause negates it."""
+    if not _ENFORCE_CLAIM.search(clause):
+        return False
+    return not _NEGATORS.search(clause)
+
+
+def find_enforceability_contradictions(text: str) -> List[str]:
+    """Return the sentences that affirmatively claim non-competes are enforceable.
+
+    The text is split into sentences and each sentence into clauses. A clause is a
+    contradiction when it contains enforceability language that is not negated within
+    that same clause, and the clause is about non-competes: it names one, refers back to
+    one ("courts will not enforce them"), or sits in a sentence about non-competes without
+    naming some other instrument (an NDA, a non-solicit, an invention-assignment clause).
+
+    Negated statements such as "non-competes are not enforceable in California",
+    "courts will not enforce them", "void under §16600" and "California prohibits
+    non-competes" are therefore left alone.
+    """
+    if not text or not _NONCOMPETE_TERMS.search(text):
+        return []
+
+    offending: List[str] = []
+    for sentence in _split_sentences(text):
+        sentence_is_about_noncompete = bool(_NONCOMPETE_TERMS.search(sentence))
+        if not sentence_is_about_noncompete and not _ANAPHORA.search(sentence):
+            continue
+        for clause in _split_clauses(sentence):
+            if not _clause_asserts_enforceability(clause):
+                continue
+            clause_names_noncompete = bool(_NONCOMPETE_TERMS.search(clause) or _ANAPHORA.search(clause))
+            clause_names_other = bool(_OTHER_INSTRUMENTS.search(clause))
+            if clause_names_noncompete or (sentence_is_about_noncompete and not clause_names_other):
+                offending.append(sentence)
+                break
+    return offending
+
+
 def evaluate_briefing(final_text: str, jurisdiction: Optional[str] = None, gold: Optional[str] = None) -> Dict[str, Any]:
     """Evaluator scaffold: compares final briefing to optional gold and jurisdictional constraints.
 
@@ -147,32 +247,15 @@ def evaluate_briefing(final_text: str, jurisdiction: Optional[str] = None, gold:
 
     # Jurisdiction-specific heuristics
     if jurisdiction and jurisdiction.lower() == "california":
-        # If the briefing asserts that non-competes are enforceable in CA, that's a contradiction.
-        # Detect direct claims and modal language that implies enforceability.
-        lower = final_text.lower()
-        has_noncomp = "non-compete" in lower or "noncompete" in lower
-
-
-        # Use a stem to catch enforce/enforcing/enforced/enforceable and modal phrasing
-        enforce_patterns = [
-            r"enforc",  # stem match for enforce/enforcing/enforced/enforceable
-            r"can be enforc",
-            r"may be enforc",
-            r"could be enforc",
-            r"likely.*enforc",
-            r"increase the likelihood",
-            r"increase the chance",
-            r"minimiz.*legal risk.*enforc",
-            r"sets a precedent for enforc",  # catch "sets a precedent for enforcing"
-            r"can effectively enforc"
-        ]
-
-        import re
-        enforces = any(re.search(pat, lower) for pat in enforce_patterns)
-
-        if has_noncomp and enforces:
+        # Negation-aware check: only sentences that affirmatively claim non-competes
+        # are enforceable count as contradictions. "Non-competes are NOT enforceable
+        # in California" is a correct statement and must not be flagged.
+        offending = find_enforceability_contradictions(final_text)
+        if offending:
             contradiction = True
             details.append("Contradiction: California Business & Professions Code §16600 disfavors employee non-competes.")
+            for sentence in offending:
+                details.append(f"Offending claim: \"{sentence[:160]}\"")
             score = min(score, 20)
 
     return {
